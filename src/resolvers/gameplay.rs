@@ -23,16 +23,28 @@ fn object_display_name(ptr: *mut c_void) -> Option<String> {
         .filter(|name| !name.trim().is_empty())
 }
 
+/// Cheap pre-filter: non-null, 8-byte aligned and inside the canonical user-mode range.
+fn looks_like_pointer(p: *const c_void) -> bool {
+    let v = p as usize;
+    v >= 0x10000 && v < 0x0000_7FFF_FFFF_0000 && v % 8 == 0
+}
+
 fn object_inherits_from(ptr: *mut c_void, needle: &str) -> bool {
+    if !looks_like_pointer(ptr) { return false; }
     let mut curr = unsafe { (ptr as *const UObject).as_ref() }
         .and_then(|o| unsafe { o.uobject_base_utility.uobject_base.class_private.as_ref() })
         .map(|c| &c.ustruct as *const UStruct);
 
+    let mut depth = 0;
     while let Some(s) = unsafe { curr.and_then(|p| p.as_ref()) } {
-        if s.ufield.uobject.uobject_base_utility.uobject_base.name_private.to_string().contains(needle) {
+        // Exact class-name match: a substring match would let "Character" accept classes such as
+        // CharacterDeathcam_C, which do not have the ATBLCharacter layout.
+        if s.ufield.uobject.uobject_base_utility.uobject_base.name_private.to_string() == needle {
             return true;
         }
-        curr = (!s.super_struct.is_null()).then_some(s.super_struct);
+        depth += 1;
+        if depth > 32 { return false; }
+        curr = looks_like_pointer(s.super_struct.cast()).then_some(s.super_struct);
     }
     false
 }
@@ -58,6 +70,7 @@ fn fallback_combat_actor(ptr: *mut c_void) -> Option<CombatActor> {
 }
 
 fn combat_actor_from_player_state(player_state: *mut APlayerState) -> Option<CombatActor> {
+    if !looks_like_pointer(player_state.cast()) { return None; }
     let ps = unsafe { player_state.as_ref() }?;
     let name = ps.player_name_private.copy_to_string().ok()?;
     (!name.trim().is_empty()).then(|| {
@@ -74,6 +87,7 @@ fn combat_actor_from_actor(ptr: *mut c_void) -> Option<CombatActor> {
 
         return combat_actor_from_player_state(pawn.player_state as *mut APlayerState)
             .or_else(|| {
+                if !looks_like_pointer(pawn.controller.cast()) { return None; }
                 let controller = unsafe { pawn.controller.cast::<AController>().as_ref() }?;
                 combat_actor_from_player_state(controller.player_state)
             })
@@ -81,7 +95,7 @@ fn combat_actor_from_actor(ptr: *mut c_void) -> Option<CombatActor> {
             .or_else(|| fallback_combat_actor(ptr));
     }
 
-    if object_inherits_from(ptr, "Controller") {
+    if object_inherits_from(ptr, "Controller") || object_inherits_from(ptr, "PlayerController") || object_inherits_from(ptr, "AIController") || object_inherits_from(ptr, "TBLPlayerController") {
         let controller = unsafe { (ptr as *mut AController).as_ref() }?;
         return combat_actor_from_player_state(controller.player_state)
             .or_else(|| fallback_combat_actor(ptr));
