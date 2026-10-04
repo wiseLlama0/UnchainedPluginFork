@@ -1,6 +1,6 @@
 use std::os::raw::c_void;
 
-use crate::{game::engine::ENetMode, sdebug, sinfo, tools::hook_globals::{cli_args, globals}, ue::{FName, UFunction, UObject, UStruct}};
+use crate::{game::engine::ENetMode, sdebug, sinfo, tools::hook_globals::{cli_args, globals}, ue::{FName, UFunction, UObject}};
 use crate::resolvers::unchained_integration::*;
 
 // Desync patch
@@ -36,28 +36,38 @@ define_pattern_resolver!(DedicatedServerInit, [
 CREATE_HOOK!(DedicatedServerInit, ACTIVE, NONE, (), (this_ptr: *mut c_void), {});
 
 // Block the ClientSetCameraMode event spam (deadlock)
+//
+// Under --desync-patch, ClientSetCameraMode feeds an unbounded event loop: loading a Team
+// Objective map ends in EXCEPTION_STACK_OVERFLOW a few seconds later. The hook is therefore
+// installed whenever --desync-patch is given.
+thread_local! {
+    // FName comparison index -> "is ClientSetCameraMode". Bounded by the number of distinct UFunctions.
+    static CAMERA_MODE_INDEX_CACHE: std::cell::RefCell<std::collections::HashMap<u32, bool>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 define_pattern_resolver!(ProcessEvent,["40 55 56 57 41 54 41 55 41 56 41 57 48 81 EC F0 00 00 00 48 8D 6C 24 30 48 89 9D 18 01"]);
-CREATE_HOOK!(ProcessEvent, { || false }, NONE, (), (
-    object: *mut UObject, 
-    function: *mut UFunction, 
+CREATE_HOOK!(ProcessEvent, { || cli_args().apply_desync_patch }, NONE, (), (
+    object: *mut UObject,
+    function: *mut UFunction,
     params: *mut c_void
 ),{
-    let func_name = unsafe { (*function).ustruct.ufield.uobject.uobject_base_utility.uobject_base.name_private.to_string() };
-    
-    if func_name == "ClientSetCameraMode" {
-        sdebug!(f; "SetCameramode blocked");
+    if function.is_null() {
+        return CALL_ORIGINAL!(ProcessEvent(object, function, params));
+    }
+    // Every event passes here, so decide "is this ClientSetCameraMode?" by FName index, with the
+    // string conversion done once per distinct function and remembered.
+    let index = unsafe { (*function).ustruct.ufield.uobject.uobject_base_utility.uobject_base.name_private.comparison_index.value };
+    let blocked = CAMERA_MODE_INDEX_CACHE.with(|cache| {
+        *cache.borrow_mut().entry(index).or_insert_with(|| {
+            let func_name = unsafe { (*function).ustruct.ufield.uobject.uobject_base_utility.uobject_base.name_private.to_string() };
+            func_name == "ClientSetCameraMode"
+        })
+    });
+    if blocked {
+        sdebug!(f; "ClientSetCameraMode blocked");
         return;
     }
-    else {     
-        let current_class = unsafe { (*object).uobject_base_utility.uobject_base.class_private as *const UStruct };
-
-        let mut name: String = "".to_string();
-        if !current_class.is_null() {
-            name = unsafe { (*current_class).ufield.uobject.uobject_base_utility.uobject_base.name_private.to_string() };
-        }
-        crate::sdebug![f; "\x1b[32m[{}::{}]\x1b[0m ", name, func_name];   
-        return CALL_ORIGINAL!(ProcessEvent(object, function, params));    
-    }
+    CALL_ORIGINAL!(ProcessEvent(object, function, params))
 });
 
 // Desync for listen server
