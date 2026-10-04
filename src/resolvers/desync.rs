@@ -1,6 +1,6 @@
 use std::os::raw::c_void;
 
-use crate::{game::engine::ENetMode, sdebug, sinfo, tools::hook_globals::{cli_args, globals}, ue::{FName, UFunction, UObject}};
+use crate::{game::engine::ENetMode, sdebug, sinfo, tools::hook_globals::{cli_args, globals}, ue::{FName, UFunction, UObject, UStruct}};
 use crate::resolvers::unchained_integration::*;
 
 // Desync patch
@@ -40,9 +40,29 @@ CREATE_HOOK!(DedicatedServerInit, ACTIVE, NONE, (), (this_ptr: *mut c_void), {})
 // Under --desync-patch, ClientSetCameraMode feeds an unbounded event loop: loading a Team
 // Objective map ends in EXCEPTION_STACK_OVERFLOW a few seconds later. The hook is therefore
 // installed whenever --desync-patch is given.
+//
+// The same hook carries a per-thread depth counter far above legitimate Blueprint nesting, so a
+// further event loop of this kind becomes a dropped event plus an error log naming it instead of
+// a stack overflow.
 thread_local! {
+    static PROCESS_EVENT_DEPTH: std::cell::Cell<u32> = std::cell::Cell::new(0);
     // FName comparison index -> "is ClientSetCameraMode". Bounded by the number of distinct UFunctions.
     static CAMERA_MODE_INDEX_CACHE: std::cell::RefCell<std::collections::HashMap<u32, bool>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+// UE's own script recursion limit is 120; native+script nesting in normal play stays well below
+// this. A runaway loop reaches it within milliseconds.
+const PROCESS_EVENT_MAX_DEPTH: u32 = 300;
+
+fn process_event_names(object: *mut UObject, function: *mut UFunction) -> (String, String) {
+    let func_name = unsafe { (*function).ustruct.ufield.uobject.uobject_base_utility.uobject_base.name_private.to_string() };
+    let mut class_name = String::new();
+    if !object.is_null() {
+        let current_class = unsafe { (*object).uobject_base_utility.uobject_base.class_private as *const UStruct };
+        if !current_class.is_null() {
+            class_name = unsafe { (*current_class).ufield.uobject.uobject_base_utility.uobject_base.name_private.to_string() };
+        }
+    }
+    (class_name, func_name)
 }
 
 define_pattern_resolver!(ProcessEvent,["40 55 56 57 41 54 41 55 41 56 41 57 48 81 EC F0 00 00 00 48 8D 6C 24 30 48 89 9D 18 01"]);
@@ -54,12 +74,18 @@ CREATE_HOOK!(ProcessEvent, { || cli_args().apply_desync_patch }, NONE, (), (
     if function.is_null() {
         return CALL_ORIGINAL!(ProcessEvent(object, function, params));
     }
+    let depth = PROCESS_EVENT_DEPTH.with(|d| d.get());
+    if depth >= PROCESS_EVENT_MAX_DEPTH {
+        let (class_name, func_name) = process_event_names(object, function);
+        log::error!(target: "ProcessEvent", "recursion depth {depth} reached; dropping {class_name}::{func_name} to break the loop");
+        return;
+    }
     // Every event passes here, so decide "is this ClientSetCameraMode?" by FName index, with the
     // string conversion done once per distinct function and remembered.
     let index = unsafe { (*function).ustruct.ufield.uobject.uobject_base_utility.uobject_base.name_private.comparison_index.value };
     let blocked = CAMERA_MODE_INDEX_CACHE.with(|cache| {
         *cache.borrow_mut().entry(index).or_insert_with(|| {
-            let func_name = unsafe { (*function).ustruct.ufield.uobject.uobject_base_utility.uobject_base.name_private.to_string() };
+            let (_, func_name) = process_event_names(std::ptr::null_mut(), function);
             func_name == "ClientSetCameraMode"
         })
     });
@@ -67,6 +93,10 @@ CREATE_HOOK!(ProcessEvent, { || cli_args().apply_desync_patch }, NONE, (), (
         sdebug!(f; "ClientSetCameraMode blocked");
         return;
     }
+    PROCESS_EVENT_DEPTH.with(|d| d.set(depth + 1));
+    struct DepthGuard;
+    impl Drop for DepthGuard { fn drop(&mut self) { PROCESS_EVENT_DEPTH.with(|d| d.set(d.get().saturating_sub(1))); } }
+    let _guard = DepthGuard;
     CALL_ORIGINAL!(ProcessEvent(object, function, params))
 });
 
