@@ -35,6 +35,28 @@ impl FUObjectArray {
         CriticalSectionGuard::lock(&self.obj_objects_critical, &self.obj_objects)
     }
 
+    /// True when `obj` is a live object: the InternalIndex stored in it, read without faulting,
+    /// names a slot that still holds this very pointer, and that slot is neither pending kill nor
+    /// unreachable. A dangling or garbage pointer fails because its memory is unreadable, or its
+    /// slot is out of range, empty or holds another object. Reads the chunk table without the
+    /// lock, as allocate_serial_number below does; meant for the game thread.
+    pub fn is_live(&self, obj: *const UObjectBase) -> bool {
+        const UNREACHABLE: i32 = 1 << 28;
+        const PENDING_KILL: i32 = 1 << 29;
+        if obj.is_null() {
+            return false;
+        }
+        let index_ptr = (obj as *const u8)
+            .wrapping_add(std::mem::offset_of!(UObjectBase, internal_index)) as *const i32;
+        let Some(index) = super::try_read(index_ptr) else { return false };
+        let objects = unsafe { &*self.obj_objects.get() };
+        if index < 0 || index >= objects.num_elements || objects.max_chunks <= 0 {
+            return false;
+        }
+        let item = objects.item(index);
+        std::ptr::eq(item.object, obj) && item.flags & (UNREACHABLE | PENDING_KILL) == 0
+    }
+
     pub fn allocate_serial_number(&self, index: ObjectIndex) -> i32 {
         let objects = unsafe { &*self.obj_objects.get() };
         let item = objects.item(index);

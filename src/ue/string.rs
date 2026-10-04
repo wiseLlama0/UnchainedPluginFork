@@ -19,6 +19,7 @@ pub enum FStringCopyError {
     MemoryReadFailed,
     PartialRead,
     Utf16DecodeFailed,
+    ImplausibleHeader,
 }
 
 impl FStringCopyError {
@@ -29,6 +30,7 @@ impl FStringCopyError {
             FStringCopyError::MemoryReadFailed => "FString backing memory copy failed",
             FStringCopyError::PartialRead => "FString backing memory copy was partial",
             FStringCopyError::Utf16DecodeFailed => "FString UTF-16 decode failed",
+            FStringCopyError::ImplausibleHeader => "FString header had an impossible length",
         }
     }
 }
@@ -38,12 +40,27 @@ impl TArray<u16> {
     /// in the FString's backing buffer, which is not safe to do in a multithreaded environment.
     /// This function copies the buffer to a new string, which is safe to do in a multithreaded
     /// environment.
+    ///
+    /// The header (data pointer, length, capacity) is read the same way as the buffer, so an
+    /// FString inside a dangling or garbage object returns an error instead of raising an access
+    /// violation. A header whose length is negative, exceeds its capacity or is implausibly large
+    /// is rejected before anything is allocated.
     pub fn copy_to_string(&self) -> Result<String, FStringCopyError> {
-        let utf16_len = self.len();
-        let utf16_ptr = self.as_ptr();
-        if utf16_len == 0 || utf16_ptr.is_null() {
+        #[derive(Clone, Copy)]
+        #[repr(C)]
+        struct Header { data: *const u16, num: i32, max: i32 }
+        const MAX_CODE_UNITS: i32 = 1 << 20;
+
+        let header = super::try_read(self as *const Self as *const Header)
+            .ok_or(FStringCopyError::MemoryReadFailed)?;
+        if header.num == 0 || header.data.is_null() {
             return Err(FStringCopyError::NullOrEmptyBuffer);
         }
+        if header.num < 0 || header.num > header.max || header.num > MAX_CODE_UNITS {
+            return Err(FStringCopyError::ImplausibleHeader);
+        }
+        let utf16_len = header.num as usize;
+        let utf16_ptr = header.data;
 
         let byte_len = utf16_len
             .checked_mul(std::mem::size_of::<u16>())

@@ -3,15 +3,18 @@ use std::os::raw::c_void;
 use crate::events::models::{CombatActor, Damage, DamageSource, GameEvent, Kill};
 use crate::features::events::EVENT_SYSTEM;
 use crate::game::chivalry2::{AController, APlayerState, ATBLCharacter, FDeathDamageTakenEvent, FDamageTakenEvent, PlayerFlags};
+use crate::tools::hook_globals::globals;
 use crate::ue::{UObject, UStruct};
 
 fn object_class_name(ptr: *mut c_void) -> Option<String> {
+    if !is_live_object(ptr) { return None; }
     let obj = unsafe { (ptr as *const UObject).as_ref() }?;
     let class = unsafe { obj.uobject_base_utility.uobject_base.class_private.as_ref() }?;
     Some(class.ustruct.ufield.uobject.uobject_base_utility.uobject_base.name_private.to_string())
 }
 
 fn object_name(ptr: *mut c_void) -> Option<String> {
+    if !is_live_object(ptr) { return None; }
     let obj = unsafe { (ptr as *const UObject).as_ref() }?;
     Some(obj.uobject_base_utility.uobject_base.name_private.to_string())
 }
@@ -23,14 +26,22 @@ fn object_display_name(ptr: *mut c_void) -> Option<String> {
         .filter(|name| !name.trim().is_empty())
 }
 
-/// Cheap pre-filter: non-null, 8-byte aligned and inside the canonical user-mode range.
+/// Cheap pre-filter: non-null, 8-byte aligned and inside the canonical user-mode range. Not proof
+/// that an object lives there (0x100000000 passes); use is_live_object before reading through a
+/// pointer.
 fn looks_like_pointer(p: *const c_void) -> bool {
     let v = p as usize;
     v >= 0x10000 && v < 0x0000_7FFF_FFFF_0000 && v % 8 == 0
 }
 
+/// True when `p` is a live UObject according to GUObjectArray (FUObjectArray::is_live): catches
+/// unmapped garbage and dangling pointers to destroyed objects alike.
+fn is_live_object(p: *const c_void) -> bool {
+    looks_like_pointer(p) && unsafe { globals().guobject_array_unchecked() }.is_live(p.cast())
+}
+
 fn object_inherits_from(ptr: *mut c_void, needle: &str) -> bool {
-    if !looks_like_pointer(ptr) { return false; }
+    if !is_live_object(ptr) { return false; }
     let mut curr = unsafe { (ptr as *const UObject).as_ref() }
         .and_then(|o| unsafe { o.uobject_base_utility.uobject_base.class_private.as_ref() })
         .map(|c| &c.ustruct as *const UStruct);
@@ -69,8 +80,13 @@ fn fallback_combat_actor(ptr: *mut c_void) -> Option<CombatActor> {
     Some(CombatActor::new(normalize_display_name(&obj), is_bot))
 }
 
-fn combat_actor_from_player_state(player_state: *mut APlayerState) -> Option<CombatActor> {
-    if !looks_like_pointer(player_state.cast()) { return None; }
+/// `via` names the field the pointer came from, for the warning when it is not a live object.
+fn combat_actor_from_player_state(player_state: *mut APlayerState, via: &str) -> Option<CombatActor> {
+    if player_state.is_null() { return None; }
+    if !is_live_object(player_state.cast()) {
+        crate::swarn!(f; "ignoring PlayerState {:p} from {}: not a live object", player_state, via);
+        return None;
+    }
     let ps = unsafe { player_state.as_ref() }?;
     let name = ps.player_name_private.copy_to_string().ok()?;
     (!name.trim().is_empty()).then(|| {
@@ -80,29 +96,40 @@ fn combat_actor_from_player_state(player_state: *mut APlayerState) -> Option<Com
 
 fn combat_actor_from_actor(ptr: *mut c_void) -> Option<CombatActor> {
     if ptr.is_null() { return None; }
+    if !is_live_object(ptr) {
+        crate::swarn!(f; "ignoring combat actor {:p}: not a live object", ptr);
+        return None;
+    }
 
-    if object_inherits_from(ptr, "TBLCharacter") || object_inherits_from(ptr, "Character") {
+    let is_tbl_character = object_inherits_from(ptr, "TBLCharacter");
+    if is_tbl_character || object_inherits_from(ptr, "Character") {
+        // The APawn fields are valid on any Character; the cast to ATBLCharacter is only read
+        // further for LastPlayerState, which exists on ATBLCharacter alone and lies past the end
+        // of a plain ACharacter.
         let char = unsafe { (ptr as *mut ATBLCharacter).as_ref() }?;
         let pawn = &char.base_tbl_character_base.base_character.base_pawn;
 
-        return combat_actor_from_player_state(pawn.player_state as *mut APlayerState)
+        return combat_actor_from_player_state(pawn.player_state as *mut APlayerState, "Pawn.PlayerState")
             .or_else(|| {
-                if !looks_like_pointer(pawn.controller.cast()) { return None; }
+                if !is_live_object(pawn.controller) { return None; }
                 let controller = unsafe { pawn.controller.cast::<AController>().as_ref() }?;
-                combat_actor_from_player_state(controller.player_state)
+                combat_actor_from_player_state(controller.player_state, "Pawn.Controller.PlayerState")
             })
-            .or_else(|| combat_actor_from_player_state(char.last_player_state as *mut APlayerState))
+            .or_else(|| {
+                if !is_tbl_character { return None; }
+                combat_actor_from_player_state(char.last_player_state as *mut APlayerState, "TBLCharacter.LastPlayerState")
+            })
             .or_else(|| fallback_combat_actor(ptr));
     }
 
     if object_inherits_from(ptr, "Controller") || object_inherits_from(ptr, "PlayerController") || object_inherits_from(ptr, "AIController") || object_inherits_from(ptr, "TBLPlayerController") {
         let controller = unsafe { (ptr as *mut AController).as_ref() }?;
-        return combat_actor_from_player_state(controller.player_state)
+        return combat_actor_from_player_state(controller.player_state, "Controller.PlayerState")
             .or_else(|| fallback_combat_actor(ptr));
     }
 
     if object_inherits_from(ptr, "PlayerState") {
-        return combat_actor_from_player_state(ptr.cast())
+        return combat_actor_from_player_state(ptr.cast(), "PlayerState")
             .or_else(|| fallback_combat_actor(ptr));
     }
 
